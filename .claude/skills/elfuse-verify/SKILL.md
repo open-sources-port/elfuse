@@ -127,6 +127,91 @@ Apple's 3.81.
 `verify-mutants` accepts `MUTANT_TARGET=<name>`, `MUTANT_JOBS=<n>`, and
 `MUTANT_SINCE=<rev>` for a changed-only run.
 
+Read past the "N mutations, N caught" line. It also prints the proved functions
+that have no mutation yet, and that list, not the caught count, is the honest
+measure of what the gate covers: all-caught alongside a handful of functions
+nobody has tried to break says the gate is green and that those proofs have
+never been asked whether they would reject a broken source. They are not
+failures, and they are not covered either.
+
+Recompute that list before quoting it, and read what it counts. It counts
+distinct functions now; it used to count `(target, function)` pairs, so a
+function proved by two targets showed up twice and read as uncovered under its
+second target even though the first mutates it. That inflated the gap fourfold
+the last time it was checked - twelve listings, three functions.
+
+A function can also sit in a `_FCTS` list with no ACSL contract at all, proved
+only for absence of runtime errors. Nothing there can reject a mutation, so
+adding one is wasted effort until the function has a contract: that is the fix,
+and it is usually two lines. Write the contract in the domain the code is in,
+too. `futex_uaddr_is_aligned` would not discharge as `uaddr % 4 == 0` and does
+as `(uaddr & 0x3) == 0`, because bridging modulo and bitmask on a 64-bit value
+is what the prover times out on, not the property itself.
+
+Adding a contract raises the obligation count, so raise
+`VERIFY_<T>_MIN_GOALS` with it. That floor is a tripwire against an emptied
+body or a dropped contract, which prove 0 of 0 and would otherwise pass; it is
+meant to sit at the target's baseline. Two contracts added here left it 15 and
+2 obligations low, and nothing failed to say so, because a floor is only ever
+compared against from below.
+
+Mutating a function that lives in an included header rather than in
+`VERIFY_<T>_SRC` works: the runner stages the mutant in its own directory and
+prepends it via `MUTANT_INCDIR`, where it shadows the real header. What a
+target may mutate is its source plus the headers in its `VERIFY_<T>_SCAN`.
+
+The staged path must mirror the original's path under `src/`, and
+`MUTANT_INCDIR` must be the staging ROOT rather than the copy's parent, because
+the spelling in the `#include` is what the preprocessor searches for. Deriving
+it as the parent got `src/utils.h` right by luck and every nested header wrong:
+`"proved/netlink.h"` resolved to `<parent>/proved/netlink.h`, missed, fell
+through `-Isrc` to the real header, and the run proved unmutated code while
+reporting a mutation nobody caught.
+
+The unmutated baseline cannot catch that, and it is worth knowing why, because
+the comment that claimed it could was wrong. The baseline stages a copy
+identical to the file it shadows, so whether the preprocessor opens the shadow
+or falls through, the program proved is the same and the run passes either way.
+What does catch it is a probe: stage a copy carrying `#error`, require the run
+to fail naming it, and read the LOG rather than make's stdout, since the recipe
+redirects Frama-C there and a non-zero exit alone is also what a broken
+override gives. It costs a parse, not a proof.
+
+### A mutation is caught by exhaustion here, not by refutation
+
+Worth knowing before tightening the gate on principle. An open goal means the
+prover either reached a conclusion the mutant cannot satisfy (`[Unknown]`,
+`[Failed]`) or ran out of budget (`[Timeout]`, `[Stepout]`), and only the first
+is a refutation. In this tree the first never happens: across every mutation
+log the tag is `[Timeout]`, and raising the budget eightfold to 240s on a host
+at 0.3 to 0.6 runnable threads per CPU left all four `futexdeadline` mutations
+exhausting exactly as they did at 30s. Alt-Ergo and Z3 do not refute these
+goals, they grind. So refusing to count exhaustion does not make the gate
+stricter, it makes "caught" unreachable and the gate permanently red.
+
+What separates a broken contract from a merely hard one is the baseline, not
+the tag: the unmutated source proves every goal, and the mutant, narrowed to
+the mutated function, exhausts on that function's own goal. A goal that were
+only hard would exhaust in the baseline too, and a failing baseline is fatal
+rather than scored. The residual gap is a mutation that turns an easy true goal
+into a hard true one, which no verdict tag available here would catch either.
+
+Two things follow. Report the resource verdicts separately so the count never
+reads as "these proofs refute their mutants". And do not diagnose them as load
+without measuring: a mutation run fans out and becomes its own load source, so
+a split computed during a parallel run will always disqualify itself. Serial
+(`MUTANT_JOBS=1`) on a quiet host is the only measurement that means anything,
+and here it returned the same answer.
+
+The mutation runs pass `-wp-cache none` for a related reason. WP's cache
+defaults to `update` and stores a timeout as a stored verdict just like a
+conclusion, so a replayed timeout would be a catch obtained with no prover run
+at all. `make verify` keeps its cache, which is what makes a re-prove cheap;
+only the mutation gate, where a fresh verdict is the whole point, turns it off.
+That distinction is not academic: an `elf_place_segment` contract retried here
+came back Timeout from the cache on a quiet host, and only defeating the cache
+showed the real result.
+
 `scripts/proof-scope.py` decides which targets a diff can reach, and
 `.github/workflows/verify.yml` builds its jobs from it, so a target the branch
 cannot affect gets no runner. It answers two questions: which targets to prove,
@@ -182,7 +267,8 @@ it costs one invocation and rules candidates out for free.
 FC=$(command -v frama-c)
 ARGS="-nostdinc -isystem $($FC -print-share-path)/libc -Iframa-c-stubs \
       -include prelude.h -include macos-libc.h -Isrc -Ibuild"
-$FC -machdep gcc_x86_64 -cpp-extra-args="$ARGS" <file.c>
+FILE=src/syscall/fs-stat.c
+$FC -machdep gcc_x86_64 -cpp-extra-args="$ARGS" "$FILE"
 ```
 
 `CPP_DEFS` is empty for every target but `verify-gva`, so leaving it out
@@ -327,7 +413,7 @@ Two rules about what any of that proves:
   reading is `"unavailable"`, since an unread host is not a quiet one. Only a
   measured quiet host earns `confidence: high`.
 - Re-running is not re-measuring, and this is the trap. WP's cache defaults to
-  `Update`, so it stores timeout verdicts too and replays them. Measured here:
+  `update`, so it stores timeout verdicts too and replays them. Measured here:
   the same six functions, run under load (one-minute average 40 to 61 on 8
   cores) and again at load 3.3, produced the identical `proof_receipt` sha256,
   with every timeout goal carrying `from_cache: true`. The second run proved

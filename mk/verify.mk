@@ -163,9 +163,43 @@ FRAMAC_BUILD_GATES := scripts/check-stub-constants.py \
                       scripts/check-char-signedness.py \
                       scripts/check-wp-result.py
 
-FRAMAC_CPP_ARGS = -nostdinc \
+# One spelling. The recipe puts it in FRAMAC_CPP_ARGS and the emitter passes it
+# as a flag, so stating it twice is the drift the split above exists to prevent:
+# drop it from one and a consumer proves against the real macOS headers while
+# make verify-<name> proves against the modeled libc.
+FRAMAC_NOSTDINC := -nostdinc
+
+# A mutation of an INCLUDED header cannot travel through VERIFY_<T>_SRC, which
+# names one file and is what the prover is pointed at. The mutation runner
+# stages the broken header in its own directory and hands that directory over
+# here, where it precedes src/ in the include search and therefore shadows the
+# real one.
+#
+# Assigned, not ?=, so it is empty for every ordinary run and stays that way. A
+# make command line still overrides it, which is the only caller there is; ?=
+# would additionally let a stray environment variable of this name prepend an
+# include directory to all 21 proof targets, silently proving a program nobody
+# asked for.
+#
+# Both forms were measured, and they differ, which is the whole point:
+#   make -n verify-align MUTANT_INCDIR=/tmp/x   puts -I/tmp/x first, as intended
+#   MUTANT_INCDIR=/tmp/x make -n verify-align   injects nothing under :=
+# The second is the environment form. Under ?= it did inject; under := it does
+# not, and the command line still wins. Read the second line as the fix
+# working, not as evidence of a leak.
+MUTANT_INCDIR :=
+
+# WP's cache defaults to 'update', which stores a verdict and replays it. For
+# make verify that is what makes a re-run cheap, and it is left alone. For the
+# mutation gate it is wrong: a mutation is scored caught when a goal comes back
+# open, WP records a TIMEOUT as a stored verdict just like a conclusion, and a
+# replayed timeout is therefore a catch obtained with no prover run at all. The
+# mutation runner sets this to none so every mutation verdict is measured.
+WP_CACHE :=
+
+FRAMAC_CPP_ARGS = $(FRAMAC_NOSTDINC) \
     -isystem $(FRAMAC_ISYSTEM_DIRS) \
-    $(patsubst %,-I%,$(FRAMAC_INCLUDE_DIRS)) \
+    $(patsubst %,-I%,$(MUTANT_INCDIR) $(FRAMAC_INCLUDE_DIRS)) \
     $(patsubst %,-include %,$(FRAMAC_FORCE_INCLUDES)) \
     $(CPP_DEFS)
 
@@ -312,9 +346,13 @@ their callers honor these preconditions stay test-covered
 # function left out of the set is an assumed axiom whether or not this target
 # calls it, and dropping timespec_to_poll_ms fails the gate by name.
 #
-# The cost is that verify-mutants lists those four as unmutated under this
-# target as well as under verify-timespec, where they are mutated. That is a
-# second target proving the same functions, not lost coverage.
+# Those four are proved here and mutated under verify-timespec. The coverage
+# summary counts both ways for exactly this shape: they are covered by function,
+# and they show in the per-target list as proved here without a mutation of
+# their own. That second list is not a gap to close by reflex. A mutation under
+# one target says nothing about another that proves the same function under a
+# different model, so it is worth adding only where the two environments differ
+# enough to matter.
 VERIFY_FUTEXDEADLINE_SRC  := src/runtime/futex.c
 VERIFY_FUTEXDEADLINE_FCTS := futex_remaining_ns futex_quantum_deadline \
                              linux_timespec_is_valid futex_uaddr_is_aligned \
@@ -499,7 +537,7 @@ print-verify-profiles:
 	    --include-paths '$(FRAMAC_INCLUDE_DIRS)' \
 	    --force-includes '$(FRAMAC_FORCE_INCLUDES)' \
 	    --isystem-paths "$(FRAMAC_ISYSTEM_DIRS)" \
-	    --nostdinc \
+	    $(if $(FRAMAC_NOSTDINC),--nostdinc,) \
 	    --build-gates '$(FRAMAC_BUILD_GATES)' \
 	    $(foreach t,$(VERIFY_TARGETS),--target '$(call lc,$(t))|$(VERIFY_$(t)_SRC)|$(VERIFY_$(t)_FCTS)|$(VERIFY_$(t)_MODEL)|$(VERIFY_$(t)_MIN_GOALS)|$(VERIFY_$(t)_CPP_DEFS)')
 
@@ -556,6 +594,7 @@ $(VERIFY_RULES): check-stub-constants check-stub-shadow | $(BUILD_DIR)
 	    $(SRC) -wp -wp-rte -wp-model $(MODEL) \
 	    -wp-fct $(FCT_ARG) \
 	    -wp-prover $(FRAMAC_PROVERS) -wp-timeout $(FRAMAC_TIMEOUT) \
+	    $(if $(WP_CACHE),-wp-cache $(WP_CACHE),) \
 	    > $(BUILD_DIR)/verify-$(NAME).log 2>&1; \
 	python3 scripts/check-wp-result.py --status $$? \
 	    --log $(BUILD_DIR)/verify-$(NAME).log --min-goals $(MIN_GOALS) \

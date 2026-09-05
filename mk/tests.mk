@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs check-proof-targets test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -79,6 +79,17 @@ test-mremap-tail-emfile: $(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile
 ## Verify dispatch.tbl coverage of the kernel-supported syscall set
 check-syscall-coverage:
 	@python3 scripts/check-syscall-coverage.py
+
+## Verify every src/proved/ header is proved by a target make actually generates
+#
+# Local as well as in CI. This was the one gate of the set that only ran in
+# .github/workflows/lint.yml, so a header added under src/proved/ with no
+# matching VERIFY_<T>_SRC block passed make check and failed the branch later.
+# It asks make for the target list rather than reading mk/verify.mk, which is
+# the whole point of it: a VERIFY_<T>_SRC written below the := that builds
+# VERIFY_TARGETS parses fine and generates no rule.
+check-proof-targets:
+	@python3 scripts/check-proof-targets.py
 
 ## Verify every path that can report EINTR states whether it may be restarted
 check-eintr-contract:
@@ -287,7 +298,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs test-config test-runner \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-ascii check-svc-tails check-skill-refs check-proof-targets test-config test-runner \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)

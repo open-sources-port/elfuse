@@ -179,6 +179,15 @@ MUTATIONS = [
         "                                 FUTEX_TIMESPEC_SEC_MAX);\n",
         "    return lts->tv_sec >= 0 && lts->tv_nsec >= 0;\n",
     ),
+    (
+        "futexdeadline",
+        "src/runtime/futex.c",
+        "futex_uaddr_is_aligned",
+        "narrow the alignment mask to two bytes (a misaligned futex word is "
+        "accepted and reaches a bucket)",
+        "    return (uaddr & 0x3) == 0;",
+        "    return (uaddr & 0x1) == 0;",
+    ),
     # ---- verify-futexop ----------------------------------------------------
     (
         "futexop",
@@ -778,6 +787,14 @@ MUTATIONS = [
         "        sum += (uint8_t) data[i];",
         "        sum += (unsigned int) data[i];",
     ),
+    (
+        "rsp",
+        "src/utils.h",
+        "hex_nibble",
+        "widen the uppercase run past 'F' (a non-digit decodes to 16)",
+        "    if (c >= 'A' && c <= 'F')",
+        "    if (c >= 'A' && c <= 'G')",
+    ),
     # ---- verify-elf: the three helpers that had no mutation ----------------
     (
         "elf",
@@ -842,6 +859,23 @@ MUTATIONS = [
         "advance two characters per digit (steps over the NUL terminator)",
         "        val = val * 16u + (uint64_t) d;\n        p++;",
         "        val = val * 16u + (uint64_t) d;\n        p += 2;",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_place_segment",
+        "compare the segment end against the top of the infra reserve rather "
+        "than its base (a segment ending inside the reserve is accepted)",
+        "gpa + zero_len > infra_lo",
+        "gpa + zero_len > infra_hi",
+    ),
+    (
+        "elf",
+        "src/utils.h",
+        "hex_nibble",
+        "widen the lowercase run past 'f' (a non-digit decodes to 16)",
+        "    if (c >= 'a' && c <= 'f')",
+        "    if (c >= 'a' && c <= 'g')",
     ),
     # ---- verify-dirent -----------------------------------------------------
     (
@@ -1110,15 +1144,23 @@ def target_sources():
 def target_mutable_files():
     """Files a target's mutation may edit, as {target: {paths}}.
 
-    Only VERIFY_<T>_SRC, and that restriction is structural rather than
-    cautious: run_mutation copies one file and points the prover at the copy,
-    so a mutation to any other file leaves the proof reading the original
-    through -Isrc and produces a verdict about unmutated code. src/utils.h is
-    the case that comes up, since hex_nibble lives there and both verify-elf
-    and verify-rsp prove it; covering it by mutation would need a runner that
-    stages a whole tree.
+    VERIFY_<T>_SRC, which the runner substitutes directly, plus the headers in
+    VERIFY_<T>_SCAN, which it shadows through MUTANT_INCDIR. Both reach the
+    prover; nothing else does, and a mutation naming anything else would leave
+    the proof reading the original file and produce a verdict about unmutated
+    code.
+
+    SCAN is the right authority for the second set rather than a hand-kept
+    list: it is already what the target declares as its input closure, and
+    proof-scope.py --self-test refuses a SCAN entry outside it. src/utils.h is
+    why this exists -- hex_nibble lives there and both verify-elf and
+    verify-rsp prove it, so before the shadow path neither could be mutated.
     """
-    return {target: {src} for target, src in target_sources().items()}
+    scans = verify_mk.target_scans()
+    return {
+        target: {src} | {f for f in scans.get(target, ()) if f.endswith(".h")}
+        for target, src in target_sources().items()
+    }
 
 
 def proved_functions():
@@ -1139,6 +1181,20 @@ def proved_functions():
 # check-wp-result.py's vocabulary for a run that produced no usable verdict, as
 # opposed to one where the prover genuinely could not discharge a goal. These
 # mean the harness broke, not that the proof rejected the mutation.
+# Verdicts that mean "the prover ran out of budget", as opposed to "the prover
+# reached a conclusion". Only these justify re-running something: a conclusion
+# does not change when the machine is quieter.
+RESOURCE_MARKERS = ("[Timeout]", "[Stepout]")
+REFUTATION_MARKERS = ("[Unknown]", "[Failed]")
+
+def host_load_per_cpu():
+    """One-minute load average per CPU, or None when it cannot be read."""
+    try:
+        return os.getloadavg()[0] / (os.cpu_count() or 1)
+    except (OSError, AttributeError):
+        return None
+
+
 INFRA_MARKERS = (
     "frama-c rejected the input",  # User Error: the mutant does not parse
     "its own summary is not trusted",  # frama-c crashed
@@ -1175,15 +1231,47 @@ def mutation_scope(function, old, new):
     return function
 
 
-def run_target(target, source_copy, name, fct=None):
-    """Run verify-<target> against @source_copy. Returns (ok, output)."""
-    var = f"VERIFY_{target.upper()}_SRC"
-    args = [
-        "make",
-        f"verify-{target}",
-        f"{var}={source_copy}",
-        f"NAME={name}",
-    ]
+def run_target(target, source_copy, name, fct=None, incdir=None):
+    """Run verify-<target> against @source_copy. Returns (ok, output).
+
+    Two ways in. The target's own source is substituted by overriding
+    VERIFY_<T>_SRC, which is what the prover is pointed at. An included header
+    cannot travel that way, so its mutant is staged below @incdir and that
+    directory is prepended to the include search, where it shadows the real
+    header. Passing @incdir rather than a flag is what keeps the two halves
+    agreeing: the shadow only works when the copy sits under it at the same
+    relative path the original has under src/, because that path is the
+    spelling every caller writes in its #include. Deriving the directory here
+    as the copy's parent instead got src/utils.h right by luck and every nested
+    header wrong -- "proved/netlink.h" resolved to <parent>/proved/netlink.h,
+    missed, and fell through -Isrc to the real header, so the run proved
+    unmutated code and reported it as a mutation nobody caught.
+
+    Two things the staging cannot cover, neither live today and both checked:
+
+    A quoted include is searched in the INCLUDING file's own directory before
+    any -I. So a proved .c that reached a scanned header by bare name from its
+    own directory would open the real one and the shadow would no-op silently.
+    The tree does not do this anywhere: elf.c writes "core/elf.h", netlink.c
+    writes "proved/netlink.h", futex.c writes "proved/timespec.h", and
+    src/utils.h is reached as "utils.h" only from src/core/ and src/debug/,
+    neither of which holds a utils.h of its own.
+
+    And @incdir precedes FRAMAC_STUB_DIR, so a staged path colliding with a
+    frama-c-stubs/ header or with a force-include name would shadow that
+    instead. Also not live, since staged paths mirror src/ and no src/ header
+    collides. check_shadow_reaches is what turns either into a failure rather
+    than a silent pass.
+    """
+    # Every mutation verdict is measured, never replayed. WP's cache stores a
+    # timeout the same way it stores a conclusion, and a mutation is scored
+    # caught on an open goal, so a cached timeout would be a catch with no
+    # prover run behind it.
+    args = ["make", f"verify-{target}", f"NAME={name}", "WP_CACHE=none"]
+    if incdir is not None:
+        args.append(f"MUTANT_INCDIR={incdir}")
+    else:
+        args.append(f"VERIFY_{target.upper()}_SRC={source_copy}")
 
     # Narrowing the proof set also drops the goal count below the target's
     # floor, so the floor has to come down with it. The unrestricted baseline
@@ -1202,8 +1290,72 @@ def run_target(target, source_copy, name, fct=None):
     return proc.returncode == 0, proc.stdout
 
 
+def mutates_included_header(target, src):
+    """True when @src is an input of @target but not the file it proves."""
+    return src != target_sources().get(target)
+
+
+def stage_source(work, src, as_include, text):
+    """Write @text below @work as a copy of @src, and return where it landed.
+
+    A header shadow has to keep the path every caller spells in its #include,
+    so it mirrors src/; a source copy the recipe is pointed at directly needs
+    only a name. Both need their parents to exist, which is why staging is one
+    call rather than a path helper and four lines repeated at each site.
+    """
+    path = pathlib.Path(src)
+    copy = work / (path.relative_to("src") if as_include else path.name)
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    copy.write_text(text)
+    return copy
+
+
+SHADOW_PROBE = "elfuse-mutant-shadow-probe"
+
+
+def check_shadow_reaches(target, src):
+    """Prove the header shadow is actually reached, not merely installed.
+
+    The unmutated baseline cannot show this. It stages a byte-identical copy,
+    so whether the preprocessor opens the shadow or falls through -Isrc to the
+    real header, the program proved is the same and the run passes either way.
+    The control is insensitive by construction to the property it was described
+    as testing, which is how a shadow that resolved to <incdir>/proved/x.h for
+    an "#include \"proved/x.h\"" went unnoticed: every such mutation proved the
+    real header and scored MISSED.
+
+    So stage a copy that cannot compile and require the run to fail naming it.
+    An #error is decisive in the right direction: reached means the parse dies
+    on this token, not reached means the target proves exactly as usual. It
+    costs a parse rather than a proof.
+    """
+    tag = f"{target}-{src.replace('/', '-')}"
+    work = BUILD / f"shadowprobe-{tag}"
+    work.mkdir(parents=True, exist_ok=True)
+    copy = stage_source(
+        work, src, True, f'#error "{SHADOW_PROBE}"\n' + (ROOT / src).read_text()
+    )
+    ok, _out = run_target(target, copy, f"mutants/shadowprobe-{tag}", incdir=work)
+    if ok:
+        return False, "the target proved anyway; the shadow was never opened"
+
+    # The recipe sends Frama-C's own output to the log, so the diagnostic never
+    # reaches make's stdout. Read the log: a non-zero exit alone would also be
+    # produced by a broken override, and this has to name the probe to mean the
+    # preprocessor actually opened the staged file.
+    log = LOGS / f"shadowprobe-{tag}.log"
+    text = log.read_text() if log.exists() else ""
+    if SHADOW_PROBE not in text:
+        return False, f"the run failed without naming the probe (see {log})"
+    return True, ""
+
+
 def check_baseline(target, src):
     """An UNMUTATED copy must still prove through the same path.
+
+    Returns (ok, output). The output is what lets the caller separate a
+    baseline that ran out of wall clock from one that failed for a reason no
+    amount of retrying fixes.
 
     Without this control every infrastructure failure (a bad make override, a
     log path that cannot be written, a missing include) makes the target exit
@@ -1211,12 +1363,17 @@ def check_baseline(target, src):
     an earlier version of this script wrote its logs to a directory that did not
     exist, and reported all 27 mutations caught while proving nothing at all.
     """
-    work = BUILD / f"baseline-{target}"
+    tag = src.replace("/", "-")
+    work = BUILD / f"baseline-{target}-{tag}"
     work.mkdir(parents=True, exist_ok=True)
-    copy = work / pathlib.Path(src).name
-    copy.write_text((ROOT / src).read_text())
-    ok, _out = run_target(target, copy, f"mutants/baseline-{target}")
-    return ok
+    via_include = mutates_included_header(target, src)
+    copy = stage_source(work, src, via_include, (ROOT / src).read_text())
+    return run_target(
+        target,
+        copy,
+        f"mutants/baseline-{target}-{tag}",
+        incdir=work if via_include else None,
+    )
 
 
 def run_mutation(idx, mutation):
@@ -1229,8 +1386,8 @@ def run_mutation(idx, mutation):
 
     work = BUILD / f"{idx:02d}-{target}"
     work.mkdir(parents=True, exist_ok=True)
-    copy = work / pathlib.Path(src).name
-    copy.write_text(original.replace(old, new, 1))
+    via_include = mutates_included_header(target, src)
+    copy = stage_source(work, src, via_include, original.replace(old, new, 1))
 
     # NAME picks the log path, so each mutation gets its own. Concurrent
     # mutations of one target would otherwise clobber a shared log, and a
@@ -1241,12 +1398,38 @@ def run_mutation(idx, mutation):
     # allowed to read as MISSED, which is what keeps the narrowing from turning
     # a real gap into a pass.
     scope = mutation_scope(_function, old, new)
-    ok, out = run_target(target, copy, f"mutants/{target}-mut{idx:02d}", scope)
+    shadow = work if via_include else None
+    ok, out = run_target(
+        target, copy, f"mutants/{target}-mut{idx:02d}", scope, incdir=shadow
+    )
     if ok and scope:
-        ok, out = run_target(target, copy, f"mutants/{target}-mut{idx:02d}")
+        ok, out = run_target(
+            target, copy, f"mutants/{target}-mut{idx:02d}", incdir=shadow
+        )
     if ok:
         return "MISSED", "the target still passed"
 
+    # An open goal has two causes. The prover either reached a conclusion the
+    # mutant cannot satisfy (Unknown, Failed), or ran out of budget (Timeout,
+    # Stepout). Only the first is a refutation, and the second also occurs for
+    # a goal that is merely hard and still true, so the two are reported apart.
+    #
+    # Both are scored as catches, and that is a measurement rather than a
+    # concession. Alt-Ergo and Z3 in this configuration do not refute these
+    # goals, they exhaust: across every mutation log this tree produces the tag
+    # is [Timeout], never [Unknown] or [Failed], and raising the budget
+    # eightfold to 240s on a host at 0.3 to 0.6 runnable threads per CPU left
+    # all four futexdeadline mutations exhausting exactly as at 30s. Refusing to
+    # count exhaustion would not make the gate stricter, it would make "caught"
+    # unreachable and the gate permanently red.
+    #
+    # What separates a broken contract from a hard one is the baseline, not the
+    # tag. The unmutated source proves 130 of 130; the mutant, narrowed to the
+    # mutated function, exhausts on that function's own goal and proves 41 of
+    # 42. A goal that were merely hard would exhaust in the baseline too, and a
+    # failing baseline is fatal rather than scored. The residual gap is a
+    # mutation that turns an easy true goal into a hard true one, which no
+    # verdict tag available here would catch either.
     # A non-zero exit is not evidence on its own. It is equally what a crashed
     # prover, an unparsable mutant, or a broken override produces, and scoring
     # those as "caught" is how a harness reports success while checking nothing.
@@ -1254,6 +1437,12 @@ def run_mutation(idx, mutation):
     for marker in INFRA_MARKERS:
         if marker in out:
             return "INFRA", f"target failed without a verdict ({marker})"
+    if any(m in out for m in REFUTATION_MARKERS):
+        return "caught", ""
+    if any(m in out for m in RESOURCE_MARKERS):
+        load = host_load_per_cpu()
+        where = "unknown load" if load is None else f"load {load:.1f}/cpu"
+        return "RESOURCE", f"prover exhausted, not refuted; {where}"
     # Proof-level rejection means a goal went unproved. Tripping the MIN_GOALS
     # floor is NOT that: the floor sits at exactly the baseline count for every
     # target, so removing any obligation fails it even when the code is correct
@@ -1261,7 +1450,7 @@ def run_mutation(idx, mutation):
     # ensures clause does exactly that, which would score as "caught" while
     # nothing was rejected.
     if "open: " in out:
-        return "caught", ""
+        return "INFRA", "target printed an unrecognized open-goal verdict"
     if "obligations generated" in out:
         return "FLOOR", "only the MIN_GOALS floor fired; no goal went unproved"
     return "INFRA", "target failed but printed no recognizable verdict"
@@ -1386,8 +1575,9 @@ def main():
     sources = target_sources()
     mutable = target_mutable_files()
     misdirected = {
-        f"verify-{target}: mutates {src}, but VERIFY_{target.upper()}_SRC is "
-        f"{sources.get(target, '<unknown>')}"
+        f"verify-{target}: mutates {src}, which is neither "
+        f"VERIFY_{target.upper()}_SRC ({sources.get(target, '<unknown>')}) nor "
+        f"a header in VERIFY_{target.upper()}_SCAN"
         for target, src, *_rest in selected
         if src not in mutable.get(target, set())
     }
@@ -1438,14 +1628,104 @@ def main():
     # Control first, and through the same executor the mutations use: a false
     # "caught" caused by concurrency would otherwise slip past a serial
     # baseline.
-    targets = sorted({m[0] for m in selected})
+    # One baseline per (target, file) actually mutated, not per target. What
+    # this buys is narrower than it first looks: it shows that adding
+    # -I<staging> does not itself break the proof. It cannot show the shadow is
+    # reached, because the copy it stages is byte-identical to the real header.
+    # check_shadow_reaches below is the control for that half.
+    pairs = sorted({(m[0], m[1]) for m in selected})
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        oks = list(pool.map(check_baseline, targets, [sources[t] for t in targets]))
-    broken = [t for t, ok in zip(targets, oks) if not ok]
+        baselines = list(
+            pool.map(check_baseline, [t for t, _s in pairs], [s for _t, s in pairs])
+        )
+    oks = [ok for ok, _out in baselines]
+
+    # Every header shadow in the table gets one probe. Cheap (a parse each) and
+    # it is the only thing here that fails when the shadow silently no-ops.
+    # Serially, unlike everything else here. The probe asks a yes/no question
+    # about the include path and answers it from make's exit status, and that
+    # status is the one thing a concurrent sibling can spoil: run alongside the
+    # baseline pool it reported "the target proved anyway" for a staged header
+    # whose first line is #error, while the identical make invocation by hand
+    # exited non-zero with the probe named twice in its log. A control that can
+    # report the opposite of the truth is worse than no control, and two parses
+    # cost nothing worth racing for.
+    shadow_pairs = [(tgt, s) for tgt, s in pairs if mutates_included_header(tgt, s)]
+    if shadow_pairs:
+        probes = [check_shadow_reaches(tgt, s) for tgt, s in shadow_pairs]
+        unreached = [
+            f"verify-{tgt} via {s}: {why}"
+            for (tgt, s), (reached, why) in zip(shadow_pairs, probes)
+            if not reached
+        ]
+        if unreached:
+            print(
+                "  SETUP FAILED: the header shadow is not reached for: "
+                + ", ".join(unreached),
+                file=sys.stderr,
+            )
+            print(
+                "  Those mutations would prove the real header and score as "
+                "missed; fix MUTANT_INCDIR staging first.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"  {len(shadow_pairs)} header shadow(s) confirmed reached")
+
+    # Same treatment the mutations get below, and for the same reason: a prover
+    # budget is wall-clock, so a baseline can miss it because the pool and the
+    # rest of the machine were busy rather than because anything is wrong. That
+    # is not hypothetical here -- verify-netlinkwalk, the heaviest target, hit
+    # it on a host already at load 5 from outside this gate, and proved 3 of 3
+    # when re-run alone.
+    #
+    # This does not weaken the concurrent baseline above, which exists to catch
+    # a harness that only works serially. That one is still what runs first,
+    # and the retry announces itself either way, so "proves alone" stays
+    # visible as the load artifact it is rather than passing silently.
+    # Retry only what a retry can answer. A baseline that missed the wall-clock
+    # budget may well prove once the pool drains; one that failed because
+    # Frama-C rejected the input, crashed, or never ran will fail identically
+    # however quiet the machine is, and re-running it only delays a fatal that
+    # names a real defect. This mirrors the mutation-side retry below, which is
+    # scoped to INFRA for the same reason; the blanket version this replaces
+    # would have retried a broken make override as though it were load.
+    def retryable(out):
+        return any(m in out for m in RESOURCE_MARKERS)
+
+    retried = [
+        i for i, (ok, out) in enumerate(baselines) if not ok and retryable(out)
+    ]
+    serial_targets = set()
+    if retried:
+        print(
+            f"  {len(retried)} baseline(s) did not prove alongside the pool; "
+            "re-running them serially before scoring"
+        )
+        for i in retried:
+            target, src = pairs[i]
+            oks[i], _out = check_baseline(target, src)
+            verdict = "proves alone" if oks[i] else "fails alone too"
+            print(f"    verify-{target} via {src}: {verdict}")
+            if oks[i]:
+                serial_targets.add(target)
+    unretryable = [
+        f"verify-{pairs[i][0]} via {pairs[i][1]}"
+        for i, (ok, out) in enumerate(baselines)
+        if not ok and not retryable(out)
+    ]
+    if unretryable:
+        print(
+            "  baseline(s) failed for a reason a retry cannot change: "
+            + ", ".join(unretryable),
+            file=sys.stderr,
+        )
+
+    broken = [f"verify-{t} via {src}" for (t, src), ok in zip(pairs, oks) if not ok]
     if broken:
         print(
             "  SETUP FAILED: unmutated sources do not prove for: "
-            + ", ".join(f"verify-{t}" for t in broken),
+            + ", ".join(broken),
             file=sys.stderr,
         )
         print(
@@ -1454,12 +1734,47 @@ def main():
         )
         return 2
 
+    # A target whose baseline only proved once the pool was drained does not
+    # get its mutations scored from a concurrent run. "Proves alone" says the
+    # unmutated source is fine; it does not say which of load or a
+    # concurrency-only harness defect made the concurrent attempt fail, and the
+    # two are indistinguishable from here. Under the second, a mutation that
+    # the proof does NOT reject fails for the harness reason instead and scores
+    # as caught, which is the exact false pass the concurrent baseline above
+    # exists to expose. Running that target serially costs wall-clock on a
+    # loaded host and removes the ambiguity; the rest of the table keeps the
+    # pool.
+    #
+    # The concurrent baseline is still what runs first and still what decides,
+    # so this weakens nothing: a baseline that fails alone too is fatal below.
+    serial_idx = [
+        n for n, (_i, m) in enumerate(selected_pairs) if m[0] in serial_targets
+    ]
+    pooled_idx = [
+        n for n, (_i, m) in enumerate(selected_pairs) if m[0] not in serial_targets
+    ]
+    if serial_targets:
+        print(
+            f"  {len(serial_idx)} mutation(s) in "
+            + ", ".join(f"verify-{t}" for t in sorted(serial_targets))
+            + " run serially: their baseline needed the pool drained"
+        )
+
     # map hands back results in table order however the mutations interleave,
     # so a run stays diffable against the previous one.
+    results = [None] * len(selected)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        results = list(
-            pool.map(run_mutation, [i for i, _m in selected_pairs], selected)
+        pooled = list(
+            pool.map(
+                run_mutation,
+                [selected_pairs[n][0] for n in pooled_idx],
+                [selected[n] for n in pooled_idx],
+            )
         )
+    for n, r in zip(pooled_idx, pooled):
+        results[n] = r
+    for n in serial_idx:
+        results[n] = run_mutation(selected_pairs[n][0], selected[n])
 
     # INFRA means the run produced no verdict, and by far its most common cause
     # is prover starvation: several Frama-C processes, each with its own
@@ -1494,23 +1809,86 @@ def main():
         target, _src, function, desc = mutation[:4]
         suffix = f"  ({detail})" if detail else ""
         print(f"  {status:<7} verify-{target:<9} {function:<28} {desc}{suffix}")
-        if status != "caught":
+        if status not in ("caught", "RESOURCE"):
             failures.append((target, function, desc, status, detail))
+    resource = sum(1 for status, _d in results if status == "RESOURCE")
 
     # Coverage: which proved functions have no mutation at all. Reported rather
     # than enforced, so the gap is visible instead of assumed closed.
-    covered = {(m[0], m[2]) for m in MUTATIONS}
+    #
+    # Two denominators, because they answer different questions and reporting
+    # only one of them has now been wrong in both directions.
+    #
+    # By function: has anyone ever tried to break this proof? Counting
+    # (target, function) pairs here made a function proved by two targets read
+    # as uncovered under its second one even though the first mutates it, which
+    # inflated the gap fourfold: 12 listings, 3 functions.
+    #
+    # By pair: is each target's own proof of it exercised? A function proved by
+    # two targets is proved twice under two model and header environments, and
+    # a mutation under one says nothing about the other. hex_nibble is the case
+    # that made this concrete -- verify-elf and verify-rsp both prove it, and it
+    # needs a mutation in each.
+    covered_functions = {m[2] for m in MUTATIONS}
+    covered_pairs = {(m[0], m[2]) for m in MUTATIONS}
+    targets_by_function = {}
+    for target, fcts in proved_functions().items():
+        for function in set(fcts):
+            targets_by_function.setdefault(function, []).append(target)
     uncovered = [
-        f"verify-{target}:{function}"
-        for target, fcts in sorted(proved_functions().items())
-        for function in sorted(set(fcts))
-        if (target, function) not in covered
+        f"{function}  (verify-{', verify-'.join(sorted(targets))})"
+        for function, targets in sorted(targets_by_function.items())
+        if function not in covered_functions
     ]
+    uncovered_pairs = sorted(
+        f"verify-{target}:{function}"
+        for function, targets in targets_by_function.items()
+        for target in targets
+        if (target, function) not in covered_pairs
+        and function in covered_functions
+    )
 
-    print(f"\n  {len(selected)} mutations, {len(selected) - len(failures)} caught")
+    caught = len(selected) - len(failures)
+    note = f" ({resource} resource verdicts)" if resource else ""
+    print(f"\n  {len(selected)} mutations, {caught} caught{note}")
+    if resource:
+        # Exhaustion is the normal outcome here, not a symptom of a busy host,
+        # and that was settled by experiment rather than assumed. The same four
+        # futexdeadline mutations were run serially at 30s and at 240s on a host
+        # between 0.3 and 0.6 runnable threads per CPU: every one exhausted in
+        # both, and no run of this tree has ever produced [Unknown] or [Failed].
+        # So do not read a resource count as "re-run somewhere quieter"; it is
+        # what Alt-Ergo and Z3 do with a goal a mutation made unprovable.
+        #
+        # The per-mutation load is still printed beside each verdict, because a
+        # busy host can also turn a goal that WOULD have been refuted into an
+        # exhausted one, and that is worth seeing. It just is not what makes
+        # these four exhaust.
+        load = host_load_per_cpu()
+        where = (
+            "load unreadable" if load is None else f"{load:.1f}/cpu at the end"
+        )
+        print(
+            f"    {resource} caught by exhausting the prover rather than by "
+            f"refutation ({where})."
+        )
+        print(
+            "    What makes that evidence is the baseline: it proves every "
+            "goal, and each mutant exhausts on the one its own function owns."
+        )
     if uncovered:
-        print(f"  {len(uncovered)} proved function(s) with no mutation yet:")
+        print(
+            f"  {len(uncovered)} of {len(targets_by_function)} proved "
+            "function(s) have no mutation yet:"
+        )
         for name in uncovered:
+            print(f"    {name}")
+    if uncovered_pairs:
+        print(
+            f"  {len(uncovered_pairs)} proved function(s) are mutated under one "
+            "target but not another that also proves them:"
+        )
+        for name in uncovered_pairs:
             print(f"    {name}")
 
     if failures:

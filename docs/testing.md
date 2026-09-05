@@ -500,6 +500,7 @@ Suggested minimum validation:
 | Rosetta hosting, x86_64 dispatch, VZ ioctls, AOT cache | `make elfuse && make test-rosetta-all` |
 | Broad behavioral changes | `make elfuse && make check && make test-matrix` |
 | Debugger or ptrace flow | `make elfuse && make test-gdbstub` |
+| ACSL contracts, `src/proved/`, `mk/verify.mk`, the mutation harness | `make verify && make verify-mutants`, in that order and never beside a runtime lane: both fan out, and the timing lanes fail under the load they create. Add `make check` only when the change touches code rather than annotations |
 
 ## OCI Image CLI
 

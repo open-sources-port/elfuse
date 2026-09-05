@@ -1,7 +1,8 @@
 # Frama-C WP proofs
 
 .PHONY: verify check-contracts verify-mutants check-char-signedness \
-        check-stub-constants check-stub-shadow print-verify-targets
+        check-stub-constants check-stub-shadow print-verify-targets \
+        print-verify-profiles
 
 # Frama-C proof of the ELF parsing core. ELF headers come from untrusted
 # binaries, so every offset and extent computed from them is discharged as a
@@ -124,9 +125,48 @@ CPP_DEFS :=
 # git ls-files 'src/*.c' and tally the exits.
 FRAMAC_STUB_DIR := frama-c-stubs
 
+# Split out of FRAMAC_CPP_ARGS because print-verify-profiles has to state the
+# same two lists in the schema's own shape (bare directories, bare headers)
+# rather than as -I and -include flags. Written once here so the recipe and the
+# emitted profile cannot name different include paths, which the MCP compares
+# byte for byte as part of a receipt's load identity: a profile that declared a
+# path the recipe does not pass would accept a proof run under a different
+# header set as that target's evidence.
+FRAMAC_INCLUDE_DIRS := $(FRAMAC_STUB_DIR) src $(BUILD_DIR)
+FRAMAC_FORCE_INCLUDES := prelude.h macos-libc.h
+
+# Recursively expanded: $(FRAMAC) is resolved when the recipe or the emitter
+# asks, not while this file is read, so a FRAMAC override still picks its own
+# libc. Shared for the same reason as the two lists above: the modeled libc and
+# the flag that lets it win are what decide which declarations a file is
+# compiled against, so the recipe and the profile must name one environment.
+#
+# One directory, and used unquoted rather than through patsubst: the value
+# carries a shell substitution containing a space, so a $(patsubst %,-isystem %)
+# over it splits mid-command and emits
+# "-isystem $(frama-c -isystem -print-share-path)/libc". That mangling still
+# proves green on any target whose sources need no libc, which is most of them.
+FRAMAC_ISYSTEM_DIRS = $$($(FRAMAC) -print-share-path)/libc
+
+# The per-target checks a verify-<name> target runs beside Frama-C. A consumer
+# of the emitted profiles runs the prover, not this recipe, so these do not
+# happen there. Named in the profile so a verdict obtained elsewhere is not
+# mistaken for this target's, which needs all of them.
+#
+# The first two are prerequisites rather than recipe lines, and they belong
+# here for the same reason the recipe's three do, more so: they are what says
+# the stub headers a profile-driven load reaches for declare what the SDK
+# declares. A run that skipped them proved a different frama-c-stubs/.
+FRAMAC_BUILD_GATES := scripts/check-stub-constants.py \
+                      scripts/check-stub-shadow.py \
+                      scripts/check-acsl-coverage.py \
+                      scripts/check-char-signedness.py \
+                      scripts/check-wp-result.py
+
 FRAMAC_CPP_ARGS = -nostdinc \
-    -isystem $$($(FRAMAC) -print-share-path)/libc \
-    -I$(FRAMAC_STUB_DIR) -include prelude.h -include macos-libc.h -Isrc -I$(BUILD_DIR) \
+    -isystem $(FRAMAC_ISYSTEM_DIRS) \
+    $(patsubst %,-I%,$(FRAMAC_INCLUDE_DIRS)) \
+    $(patsubst %,-include %,$(FRAMAC_FORCE_INCLUDES)) \
     $(CPP_DEFS)
 
 # One proof per attacker-facing parser. Each is declared by a single
@@ -437,6 +477,31 @@ VERIFY_RULES := $(addprefix verify-,$(VERIFY_TARGET_NAMES))
 ## Print the proof target names, one per line (CI reads this to build its matrix)
 print-verify-targets:
 	@printf '%s\n' $(VERIFY_TARGET_NAMES)
+
+# The MCP refuses a named run whose load deviated from the target's profile, so
+# this is what lets "proof_coverage {verify_profile: ...}" and a stored
+# conclusion mean the same thing "make verify-<name>" means. Emitted from these
+# variables rather than written by hand so it cannot drift from the recipe: the
+# fields below are the ones the shared recipe consumes.
+#
+# -nostdinc and the -isystem libc are emitted, not omitted. Without them the
+# real macOS headers win over Frama-C's modeled libc and some files parse as a
+# different program (src/syscall/sys.c is one: its rusage _Static_assert only
+# holds against the modeled header), so a consumer that could not express them
+# was loading something weaker than what make verify-<name> proves.
+
+## Print the verify_profiles JSON that frama-c-mcp loads and proves under
+print-verify-profiles:
+	@python3 scripts/emit-verify-profiles.py \
+	    --machdep '$(FRAMAC_DATA_MODEL)' \
+	    --provers '$(FRAMAC_PROVERS)' \
+	    --timeout '$(FRAMAC_TIMEOUT)' \
+	    --include-paths '$(FRAMAC_INCLUDE_DIRS)' \
+	    --force-includes '$(FRAMAC_FORCE_INCLUDES)' \
+	    --isystem-paths "$(FRAMAC_ISYSTEM_DIRS)" \
+	    --nostdinc \
+	    --build-gates '$(FRAMAC_BUILD_GATES)' \
+	    $(foreach t,$(VERIFY_TARGETS),--target '$(call lc,$(t))|$(VERIFY_$(t)_SRC)|$(VERIFY_$(t)_FCTS)|$(VERIFY_$(t)_MODEL)|$(VERIFY_$(t)_MIN_GOALS)|$(VERIFY_$(t)_CPP_DEFS)')
 
 # One rule template, instantiated per target. The target-specific variables
 # below are exactly what the shared recipe consumes; NAME and TARGET differ only

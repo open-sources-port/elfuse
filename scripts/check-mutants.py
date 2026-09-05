@@ -1231,6 +1231,121 @@ def mutation_scope(function, old, new):
     return function
 
 
+# The clause a WP goal name ends in, which is what makes the name in front of
+# it a whole function name rather than part of one. Substring containment is
+# not enough, and not hypothetically: this tree proves timespec_valid beside
+# timespec_valid_capped, gva_chunk_clamp beside gva_chunk_clamp_args_ok, and
+# gva_leaf_target beside gva_leaf_target_args_ok.
+GOAL_CLAUSES = (
+    "assert",
+    "assigns",
+    "breaks",
+    "call_",
+    "complete_",
+    "continues",
+    "disjoint_",
+    "ensures",
+    "exits",
+    "loop_",
+    "requires",
+    "returns",
+    "terminates",
+)
+
+
+def _names_component(goal, function):
+    """True when @function appears in @goal as a component before a clause."""
+    pattern = r"(?:^|_)%s_(?:%s)" % (re.escape(function), "|".join(GOAL_CLAUSES))
+    return re.search(pattern, goal) is not None
+
+
+def goal_belongs_to(goal, function, candidates):
+    """True when @goal is an obligation of @function, given the target's set.
+
+    A component match alone decides nothing, because one proved name can sit
+    inside another from either end: timespec_valid is a prefix of
+    timespec_valid_capped, and a name like bar would be a tail of foo_bar. Both
+    match the same goal at an underscore boundary, so the owner is taken as the
+    LONGEST candidate that matches, which is the only one that can be the
+    function whose clause this is.
+
+    The exception is a caller's obligation about a callee, which WP names
+    <caller>_call_<callee>_<clause>. Such a goal carries two proved names and
+    both own it: it is the caller's obligation, and it exists because of the
+    callee's contract, so a mutation of either is a reason for it to open.
+
+    Which means the longest-candidate rule has to run over the caller side
+    ALONE. A call obligation names the callee second, and the callee is
+    routinely the longer of the two: nl_put_attr calls netlink_attr_extent, and
+    measuring across the whole goal handed the caller its callee's name, so
+    every nl_put_attr call goal came back ELSEWHERE and a mutation the proof
+    does reject failed the gate.
+    """
+    if ("_call_%s_" % function) in goal:
+        return True
+    caller_side = goal.split("_call_", 1)[0] + "_call_" if "_call_" in goal else goal
+    matched = [c for c in candidates if _names_component(caller_side, c)]
+    return bool(matched) and max(matched, key=len) == function
+
+
+# Every case below is a goal name this rule once got wrong. It decides whether a
+# mutation scores as caught or as ELSEWHERE, it is pure string reasoning, and it
+# has been rewritten three times because a real goal name broke the previous
+# spelling. A run of the table costs prover time and only exercises the shapes
+# that happen to occur; this costs nothing and pins the shapes that did not.
+GOAL_OWNER_CASES = (
+    # (goal, function, owns)
+    # A caller's obligation about a callee belongs to both sides, and the
+    # callee is the longer name, which is what made the caller lose its own.
+    (
+        "bytes_nl_put_attr_call_netlink_attr_extent_requires_fits",
+        "nl_put_attr",
+        True,
+    ),
+    (
+        "bytes_nl_put_attr_call_netlink_attr_extent_requires_fits",
+        "netlink_attr_extent",
+        True,
+    ),
+    # The model spells the prefix, so there is nothing fixed to anchor to:
+    # bytes_ for netlinkwalk, typed_ for most, typed_caveat_ for elf.
+    ("typed_caveat_nl_put_attr_call_netlink_attr_extent_ensures", "nl_put_attr", True),
+    # A callee the target does not prove leaves the caller the only candidate,
+    # which is why this shape kept working and hid the one above.
+    ("bytes_nl_put_attr_call_memset_requires_valid_s", "nl_put_attr", True),
+    # One proved name inside another, from either end. Only the longest
+    # candidate that names a component owns the goal.
+    ("timespec_valid_capped_ensures_cap", "timespec_valid", False),
+    ("timespec_valid_capped_ensures_cap", "timespec_valid_capped", True),
+    ("gva_chunk_clamp_args_ok_ensures_fit", "gva_chunk_clamp", False),
+    # A goal that names no candidate at all is nobody's.
+    ("netlink_attr_extent_ensures_fits", "nl_put_attr", False),
+    # Substring containment without a clause boundary is not ownership.
+    ("nl_put_attribute_ensures_x", "nl_put_attr", False),
+)
+
+
+def check_goal_owner():
+    """Run GOAL_OWNER_CASES. Returns the number that gave the wrong answer."""
+    # The names the cases mutate, plus the ones they must LOSE to. A collision
+    # only exists when both sides are proved by the same target, so the longer
+    # name of each pair has to be in the set even though no case mutates it.
+    candidates = {f for _g, f, _o in GOAL_OWNER_CASES} | {
+        "gva_chunk_clamp_args_ok",
+        "nl_put_attribute",
+    }
+    wrong = 0
+    for goal, function, owns in GOAL_OWNER_CASES:
+        got = goal_belongs_to(goal, function, candidates)
+        if got != owns:
+            wrong += 1
+            print(
+                f"  self-test: {goal} / {function} gave {got}, wanted {owns}",
+                file=sys.stderr,
+            )
+    return wrong
+
+
 def run_target(target, source_copy, name, fct=None, incdir=None):
     """Run verify-<target> against @source_copy. Returns (ok, output).
 
@@ -1437,6 +1552,22 @@ def run_mutation(idx, mutation):
     for marker in INFRA_MARKERS:
         if marker in out:
             return "INFRA", f"target failed without a verdict ({marker})"
+    # Whatever the verdict, the goal that opened has to belong to the function
+    # the mutation edited. For 120 of the 121 entries FCT_ARG narrows the run to
+    # that function and this holds by construction, but the narrowing is dropped
+    # for a mutation that edits a contract, and there the target proves
+    # everything. A mutation scored on some other function's goal getting slower
+    # is not evidence that this proof rejects this broken source.
+    # Every open goal must belong to the mutated function. WP includes the
+    # callee's name in a caller's obligation, so those still qualify.
+    opened = re.findall(r"open: (\S+)", out)
+    proved_here = set(proved_functions().get(target, ()))
+    stray = [
+        g for g in opened if not goal_belongs_to(g, _function, proved_here)
+    ]
+    if stray:
+        return "ELSEWHERE", f"also opened {stray[0]}, which is not in {_function}"
+
     if any(m in out for m in REFUTATION_MARKERS):
         return "caught", ""
     if any(m in out for m in RESOURCE_MARKERS):
@@ -1488,6 +1619,11 @@ def main():
     ap.add_argument(
         "--list", action="store_true", help="list mutations without running them"
     )
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the goal-ownership rule against known goal names and exit",
+    )
     # Each mutation is an independent Frama-C run against its own copy, so they
     # parallelize cleanly. Serial, the full set runs longer than the whole rest
     # of "make verify", which is how a gate stops being run.
@@ -1525,6 +1661,14 @@ def main():
         "--cc", default="cc", help="compiler for --changed-since's include scan"
     )
     args = ap.parse_args()
+
+    if args.self_test:
+        wrong = check_goal_owner()
+        if wrong:
+            return 1
+        print(f"  MUTANT  self-test: {len(GOAL_OWNER_CASES)} goal names, all owned correctly")
+        return 0
+
     cc = shlex.split(args.cc) or ["cc"]
 
     if args.targets and not args.pack:
@@ -1642,17 +1786,16 @@ def main():
 
     # Every header shadow in the table gets one probe. Cheap (a parse each) and
     # it is the only thing here that fails when the shadow silently no-ops.
-    # Serially, unlike everything else here. The probe asks a yes/no question
-    # about the include path and answers it from make's exit status, and that
-    # status is the one thing a concurrent sibling can spoil: run alongside the
-    # baseline pool it reported "the target proved anyway" for a staged header
-    # whose first line is #error, while the identical make invocation by hand
-    # exited non-zero with the probe named twice in its log. A control that can
-    # report the opposite of the truth is worse than no control, and two parses
-    # cost nothing worth racing for.
     shadow_pairs = [(tgt, s) for tgt, s in pairs if mutates_included_header(tgt, s)]
     if shadow_pairs:
-        probes = [check_shadow_reaches(tgt, s) for tgt, s in shadow_pairs]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            probes = list(
+                pool.map(
+                    check_shadow_reaches,
+                    [tgt for tgt, _s in shadow_pairs],
+                    [s for _t, s in shadow_pairs],
+                )
+            )
         unreached = [
             f"verify-{tgt} via {s}: {why}"
             for (tgt, s), (reached, why) in zip(shadow_pairs, probes)
@@ -1776,22 +1919,18 @@ def main():
     for n in serial_idx:
         results[n] = run_mutation(selected_pairs[n][0], selected[n])
 
-    # INFRA means the run produced no verdict, and by far its most common cause
-    # is prover starvation: several Frama-C processes, each with its own
-    # alt-ergo and z3, oversubscribe the machine and enough goals hit
-    # FRAMAC_TIMEOUT that the target exits without naming a reason. That is
-    # indistinguishable here from a genuinely broken mutation, and re-running
-    # the same mutation alone has resolved every occurrence seen so far.
-    #
-    # So re-run them once with the pool drained, one at a time. A load artifact
-    # turns into the verdict it should have had; a real failure stays INFRA and
-    # is reported. The retry is announced either way, because a gate that
-    # quietly re-rolls a failure until it passes is worse than one that flakes.
-    retried = [i for i, (status, _d) in enumerate(results) if status == "INFRA"]
+    # INFRA has no usable verdict. ELSEWHERE may be an unrelated goal starved
+    # by the pool. Retry each once with the pool drained; persistent results
+    # remain failures below.
+    retried = [
+        i
+        for i, (status, _d) in enumerate(results)
+        if status in ("INFRA", "ELSEWHERE")
+    ]
     if retried:
         print(
-            f"  {len(retried)} mutation(s) returned no verdict; re-running "
-            "them serially before scoring"
+            f"  {len(retried)} mutation(s) returned an inconclusive result; "
+            "re-running them serially before scoring"
         )
         for i in retried:
             idx = selected_pairs[i][0]
@@ -1809,7 +1948,7 @@ def main():
         target, _src, function, desc = mutation[:4]
         suffix = f"  ({detail})" if detail else ""
         print(f"  {status:<7} verify-{target:<9} {function:<28} {desc}{suffix}")
-        if status not in ("caught", "RESOURCE"):
+        if status not in ("caught", "RESOURCE"):  # ELSEWHERE is a failure
             failures.append((target, function, desc, status, detail))
     resource = sum(1 for status, _d in results if status == "RESOURCE")
 

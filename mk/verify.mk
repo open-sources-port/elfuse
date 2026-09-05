@@ -625,6 +625,7 @@ MUTANT_SINCE ?=
 MUTANT_TARGET ?=
 verify-mutants:
 	@echo "  MUTANT  proof targets against known-broken sources"
+	$(Q)python3 scripts/check-mutants.py --self-test
 	$(Q)python3 scripts/check-mutants.py --cc '$(CC)' \
 	    $(if $(MUTANT_JOBS),--jobs $(MUTANT_JOBS),) \
 	    $(if $(MUTANT_SINCE),--changed-since $(MUTANT_SINCE),) \

@@ -188,7 +188,7 @@ VERIFY_ELF_FCTS  := elf_add_no_wrap elf_phdr_gpa_in_segment \
                     elf_place_segment elf_check_placement elf_record_load \
                     elf_read_interp \
                     $(VERIFY_UTILS_FCTS)
-VERIFY_ELF_MIN_GOALS ?= 156
+VERIFY_ELF_MIN_GOALS ?= 159
 VERIFY_ELF_MODEL := caveat
 
 # Includes utils.h and elf.h: elf.c includes both, and utils.h already carries
@@ -320,7 +320,7 @@ VERIFY_FUTEXDEADLINE_FCTS := futex_remaining_ns futex_quantum_deadline \
                              linux_timespec_is_valid futex_uaddr_is_aligned \
                              timespec_valid timespec_valid_capped \
                              timespec_to_ns_sat timespec_to_poll_ms
-VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 128
+VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 130
 VERIFY_FUTEXDEADLINE_MODEL := typed
 VERIFY_FUTEXDEADLINE_SCAN := src/runtime/futex.c src/proved/timespec.h
 VERIFY_FUTEXDEADLINE_CLAIM := for ANY guest deadline and ANY cap the wait \

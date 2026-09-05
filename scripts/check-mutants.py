@@ -1187,6 +1187,15 @@ def proved_functions():
 RESOURCE_MARKERS = ("[Timeout]", "[Stepout]")
 REFUTATION_MARKERS = ("[Unknown]", "[Failed]")
 
+# Seconds to re-run a resource verdict at, or None to accept it as it stands.
+# Set by --escalate. Every catch this gate produces is an exhausted prover
+# rather than a refutation, so the claim that the mutant is unprovable and not
+# merely slow rests on the budget being irrelevant. That was measured by hand
+# once; this is the same measurement as a command. Off by default because it
+# costs the escalated budget on exactly the goal that already ran out of the
+# short one, once per mutation, which is the whole table.
+ESCALATE_SECONDS = None
+
 def host_load_per_cpu():
     """One-minute load average per CPU, or None when it cannot be read."""
     try:
@@ -1325,6 +1334,43 @@ GOAL_OWNER_CASES = (
 )
 
 
+# What a failed run's output must be read as. The escalated re-run reaches the
+# same classifier as the first one, and these are the readings that must not
+# drift apart: everything but a refutation or an exhausted prover is a harness
+# failure, and a harness failure that reads as RESOURCE passes the gate.
+CLASSIFY_CASES = (
+    # (output, status)
+    # A harness failure carrying a resource tag. This is the shape that must
+    # not read as RESOURCE: a crashed prover still prints whatever it got to,
+    # so the infra marker has to outrank the tag rather than sit beside it.
+    ("its own summary is not trusted\nopen: bytes_nl_put_attr_ensures\n[Timeout] ",
+     "INFRA"),
+    ("[wp] frama-c rejected the input\n[Unknown] ", "INFRA"),
+    ("open: bytes_nl_put_attr_ensures_fits\n[Unknown] ", "caught"),
+    ("open: bytes_nl_put_attr_ensures_fits\n[Timeout] ", "RESOURCE"),
+    # A goal no proved name in verify-netlinkwalk owns, whatever the tag says.
+    # Ownership outranks the tag for the same reason.
+    ("open: bytes_nl_complete_span_ensures_x\n[Timeout] ", "ELSEWHERE"),
+    ("open: bytes_nl_complete_span_ensures_x\n[Unknown] ", "ELSEWHERE"),
+    ("42 obligations generated", "FLOOR"),
+    ("", "INFRA"),
+)
+
+
+def check_classify():
+    """Run CLASSIFY_CASES. Returns the number that gave the wrong answer."""
+    wrong = 0
+    for out, want in CLASSIFY_CASES:
+        got, _detail = classify_failure(out, "netlinkwalk", "nl_put_attr")
+        if got != want:
+            wrong += 1
+            print(
+                f"  self-test: {out!r} classified {got}, wanted {want}",
+                file=sys.stderr,
+            )
+    return wrong
+
+
 def check_goal_owner():
     """Run GOAL_OWNER_CASES. Returns the number that gave the wrong answer."""
     # The names the cases mutate, plus the ones they must LOSE to. A collision
@@ -1346,7 +1392,7 @@ def check_goal_owner():
     return wrong
 
 
-def run_target(target, source_copy, name, fct=None, incdir=None):
+def run_target(target, source_copy, name, fct=None, incdir=None, timeout=None):
     """Run verify-<target> against @source_copy. Returns (ok, output).
 
     Two ways in. The target's own source is substituted by overriding
@@ -1383,6 +1429,8 @@ def run_target(target, source_copy, name, fct=None, incdir=None):
     # caught on an open goal, so a cached timeout would be a catch with no
     # prover run behind it.
     args = ["make", f"verify-{target}", f"NAME={name}", "WP_CACHE=none"]
+    if timeout is not None:
+        args.append(f"FRAMAC_TIMEOUT={timeout}")
     if incdir is not None:
         args.append(f"MUTANT_INCDIR={incdir}")
     else:
@@ -1491,6 +1539,55 @@ def check_baseline(target, src):
     )
 
 
+def classify_failure(out, target, function):
+    """Read a failed target run's output into a (status, detail) verdict.
+
+    Every scoring path goes through this, whatever prover budget produced the
+    output, because the budget changes how long the prover had and nothing
+    else. A crash or a stray goal means the same thing at 240s as at 30s.
+
+    A non-zero exit is not evidence on its own. It is equally what a crashed
+    prover, an unparsable mutant, or a broken override produces, and scoring
+    those as "caught" is how a harness reports success while checking nothing.
+    The verdict has to name a reason the gate is supposed to give.
+    """
+    for marker in INFRA_MARKERS:
+        if marker in out:
+            return "INFRA", f"target failed without a verdict ({marker})"
+
+    # Whatever the verdict, the goal that opened has to belong to the function
+    # the mutation edited. For 120 of the 121 entries FCT_ARG narrows the run to
+    # that function and this holds by construction, but the narrowing is dropped
+    # for a mutation that edits a contract, and there the target proves
+    # everything. A mutation scored on some other function's goal getting slower
+    # is not evidence that this proof rejects this broken source.
+    #
+    # Every open goal, not merely one of them. WP includes the callee's name in
+    # a caller's obligation, so those still qualify.
+    opened = re.findall(r"open: (\S+)", out)
+    proved_here = set(proved_functions().get(target, ()))
+    stray = [g for g in opened if not goal_belongs_to(g, function, proved_here)]
+    if stray:
+        return "ELSEWHERE", f"also opened {stray[0]}, which is not in {function}"
+
+    if any(m in out for m in REFUTATION_MARKERS):
+        return "caught", ""
+    if any(m in out for m in RESOURCE_MARKERS):
+        return "RESOURCE", ""
+
+    # Proof-level rejection means a goal went unproved. Tripping the MIN_GOALS
+    # floor is NOT that: the floor sits at exactly the baseline count for every
+    # target, so removing any obligation fails it even when the code is correct
+    # and every remaining goal still proves. Deleting a documented-redundant
+    # ensures clause does exactly that, which would score as "caught" while
+    # nothing was rejected.
+    if "open: " in out:
+        return "INFRA", "target printed an unrecognized open-goal verdict"
+    if "obligations generated" in out:
+        return "FLOOR", "only the MIN_GOALS floor fired; no goal went unproved"
+    return "INFRA", "target failed but printed no recognizable verdict"
+
+
 def run_mutation(idx, mutation):
     """Apply one mutation to a copy and return (status, detail)."""
     target, src, _function, _desc, old, new = mutation
@@ -1517,7 +1614,12 @@ def run_mutation(idx, mutation):
     ok, out = run_target(
         target, copy, f"mutants/{target}-mut{idx:02d}", scope, incdir=shadow
     )
+    # Whichever run produced the verdict is the one an escalation has to repeat.
+    # Re-running the narrowed scope when the widened run is what opened a goal
+    # would escalate a run that had nothing to say.
+    verdict_scope = scope
     if ok and scope:
+        verdict_scope = None
         ok, out = run_target(
             target, copy, f"mutants/{target}-mut{idx:02d}", incdir=shadow
         )
@@ -1543,48 +1645,47 @@ def run_mutation(idx, mutation):
     # mutated function, exhausts on that function's own goal and proves 41 of
     # 42. A goal that were merely hard would exhaust in the baseline too, and a
     # failing baseline is fatal rather than scored. The residual gap is a
-    # mutation that turns an easy true goal into a hard true one, which no
-    # verdict tag available here would catch either.
-    # A non-zero exit is not evidence on its own. It is equally what a crashed
-    # prover, an unparsable mutant, or a broken override produces, and scoring
-    # those as "caught" is how a harness reports success while checking nothing.
-    # Require the verdict to name a reason the gate is supposed to give.
-    for marker in INFRA_MARKERS:
-        if marker in out:
-            return "INFRA", f"target failed without a verdict ({marker})"
-    # Whatever the verdict, the goal that opened has to belong to the function
-    # the mutation edited. For 120 of the 121 entries FCT_ARG narrows the run to
-    # that function and this holds by construction, but the narrowing is dropped
-    # for a mutation that edits a contract, and there the target proves
-    # everything. A mutation scored on some other function's goal getting slower
-    # is not evidence that this proof rejects this broken source.
-    # Every open goal must belong to the mutated function. WP includes the
-    # callee's name in a caller's obligation, so those still qualify.
-    opened = re.findall(r"open: (\S+)", out)
-    proved_here = set(proved_functions().get(target, ()))
-    stray = [
-        g for g in opened if not goal_belongs_to(g, _function, proved_here)
-    ]
-    if stray:
-        return "ELSEWHERE", f"also opened {stray[0]}, which is not in {_function}"
+    # mutation that turns an easy true goal into a hard true one, which
+    # --escalate is what measures.
+    status, detail = classify_failure(out, target, _function)
+    if status != "RESOURCE":
+        return status, detail
 
-    if any(m in out for m in REFUTATION_MARKERS):
-        return "caught", ""
-    if any(m in out for m in RESOURCE_MARKERS):
-        load = host_load_per_cpu()
-        where = "unknown load" if load is None else f"load {load:.1f}/cpu"
+    load = host_load_per_cpu()
+    where = "unknown load" if load is None else f"load {load:.1f}/cpu"
+    if ESCALATE_SECONDS is None:
         return "RESOURCE", f"prover exhausted, not refuted; {where}"
-    # Proof-level rejection means a goal went unproved. Tripping the MIN_GOALS
-    # floor is NOT that: the floor sits at exactly the baseline count for every
-    # target, so removing any obligation fails it even when the code is correct
-    # and every remaining goal still proves. Deleting a documented-redundant
-    # ensures clause does exactly that, which would score as "caught" while
-    # nothing was rejected.
-    if "open: " in out:
-        return "INFRA", "target printed an unrecognized open-goal verdict"
-    if "obligations generated" in out:
-        return "FLOOR", "only the MIN_GOALS floor fired; no goal went unproved"
-    return "INFRA", "target failed but printed no recognizable verdict"
+
+    # Same run, more budget. A mutant the proof genuinely rejects has no
+    # discharge to find and exhausts again; one whose goal is merely harder than
+    # the short budget allows now proves, and that is a MISSED the short run
+    # would have laundered into a catch.
+    ok, out = run_target(
+        target,
+        copy,
+        f"mutants/{target}-mut{idx:02d}-escalated",
+        verdict_scope,
+        incdir=shadow,
+        timeout=ESCALATE_SECONDS,
+    )
+    if ok:
+        return "MISSED", (
+            f"exhausted at the default budget but proves at "
+            f"{ESCALATE_SECONDS}s; the proof does not reject it"
+        )
+    # Through the same classifier, because a longer budget changes how long the
+    # prover had and nothing else. A crash, an unparsable mutant, a broken
+    # override or a stray goal means here exactly what it meant at 30s, and
+    # reading the escalated run for refutation alone would let every one of them
+    # come back RESOURCE, which passes the gate.
+    status, detail = classify_failure(out, target, _function)
+    if status == "caught":
+        return "caught", f"refuted once the budget reached {ESCALATE_SECONDS}s"
+    if status == "RESOURCE":
+        return "RESOURCE", (
+            f"prover exhausted at {ESCALATE_SECONDS}s too, not refuted; {where}"
+        )
+    return status, f"{detail}, at {ESCALATE_SECONDS}s"
 
 
 def pack_targets(targets, buckets):
@@ -1660,15 +1761,33 @@ def main():
     ap.add_argument(
         "--cc", default="cc", help="compiler for --changed-since's include scan"
     )
+    # Every catch in this table is an exhausted prover, so "caught" rests on the
+    # mutant being unprovable rather than slow. This is what tests that: re-run
+    # each resource verdict at a budget large enough that a merely-hard goal
+    # discharges, and fail the ones that then prove.
+    ap.add_argument(
+        "--escalate",
+        type=int,
+        metavar="SECONDS",
+        help="re-run every resource verdict at this prover budget; a mutation "
+        "that proves there is reported MISSED rather than caught",
+    )
     args = ap.parse_args()
 
     if args.self_test:
-        wrong = check_goal_owner()
-        if wrong:
+        if check_goal_owner() or check_classify():
             return 1
-        print(f"  MUTANT  self-test: {len(GOAL_OWNER_CASES)} goal names, all owned correctly")
+        print(
+            f"  MUTANT  self-test: {len(GOAL_OWNER_CASES)} goal names owned "
+            f"correctly, {len(CLASSIFY_CASES)} verdicts read correctly"
+        )
         return 0
 
+    if args.escalate is not None and args.escalate < 1:
+        print(f"--escalate must be at least 1, got {args.escalate}", file=sys.stderr)
+        return 2
+    global ESCALATE_SECONDS
+    ESCALATE_SECONDS = args.escalate
     cc = shlex.split(args.cc) or ["cc"]
 
     if args.targets and not args.pack:
@@ -1989,6 +2108,11 @@ def main():
 
     caught = len(selected) - len(failures)
     note = f" ({resource} resource verdicts)" if resource else ""
+    budget = (
+        f"at {ESCALATE_SECONDS}s"
+        if ESCALATE_SECONDS is not None
+        else "at the default budget only"
+    )
     print(f"\n  {len(selected)} mutations, {caught} caught{note}")
     if resource:
         # Exhaustion is the normal outcome here, not a symptom of a busy host,
@@ -2009,12 +2133,17 @@ def main():
         )
         print(
             f"    {resource} caught by exhausting the prover rather than by "
-            f"refutation ({where})."
+            f"refutation, {budget} ({where})."
         )
         print(
             "    What makes that evidence is the baseline: it proves every "
             "goal, and each mutant exhausts on the one its own function owns."
         )
+        if ESCALATE_SECONDS is None:
+            print(
+                "    That an exhausted mutant is unprovable rather than slow is "
+                "not measured here; --escalate SECONDS measures it."
+            )
     if uncovered:
         print(
             f"  {len(uncovered)} of {len(targets_by_function)} proved "

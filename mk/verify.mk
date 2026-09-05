@@ -629,7 +629,8 @@ verify-mutants:
 	$(Q)python3 scripts/check-mutants.py --cc '$(CC)' \
 	    $(if $(MUTANT_JOBS),--jobs $(MUTANT_JOBS),) \
 	    $(if $(MUTANT_SINCE),--changed-since $(MUTANT_SINCE),) \
-	    $(if $(MUTANT_TARGET),--target $(MUTANT_TARGET),)
+	    $(if $(MUTANT_TARGET),--target $(MUTANT_TARGET),) \
+	    $(if $(MUTANT_ESCALATE),--escalate $(MUTANT_ESCALATE),)
 
 ## Show that no proved function depends on plain-char signedness
 #

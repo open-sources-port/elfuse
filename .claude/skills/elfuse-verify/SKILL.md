@@ -124,8 +124,9 @@ make check-contracts  # rebuild with -DELFUSE_CONTRACT_ASSERT, then make check
 own `-j`. `VERIFY_JOBS=1` is how you ask for serial on both GNU make 4.x and
 Apple's 3.81.
 
-`verify-mutants` accepts `MUTANT_TARGET=<name>`, `MUTANT_JOBS=<n>`, and
-`MUTANT_SINCE=<rev>` for a changed-only run.
+`verify-mutants` accepts `MUTANT_TARGET=<name>`, `MUTANT_JOBS=<n>`,
+`MUTANT_SINCE=<rev>` for a changed-only run, and `MUTANT_ESCALATE=<seconds>`
+(see the exhaustion section below).
 
 Read past the "N mutations, N caught" line. It also prints the proved functions
 that have no mutation yet, and that list, not the caught count, is the honest
@@ -194,14 +195,27 @@ the tag: the unmutated source proves every goal, and the mutant, narrowed to
 the mutated function, exhausts on that function's own goal. A goal that were
 only hard would exhaust in the baseline too, and a failing baseline is fatal
 rather than scored. The residual gap is a mutation that turns an easy true goal
-into a hard true one, which no verdict tag available here would catch either.
+into a hard true one: it exhausts at the short budget and would discharge at a
+long one, and the tag alone cannot tell it from a rejection.
+
+`--escalate SECONDS` closes that gap on demand. It re-runs every resource
+verdict at the larger budget and reports MISSED for any mutation that then
+proves, which is the honest verdict for one the proof does not reject. It is
+off by default because it costs the escalated budget on precisely the goal that
+already ran out of the short one, once per mutation, and every mutation in the
+table is a resource verdict. Run it when a contract changes or when the claim
+that these mutants are unprovable rather than slow is what is in question:
+
+```
+make verify-mutants MUTANT_TARGET=futexdeadline MUTANT_ESCALATE=240
+```
 
 Two things follow. Report the resource verdicts separately so the count never
-reads as "these proofs refute their mutants". And do not diagnose them as load
-without measuring: a mutation run fans out and becomes its own load source, so
-a split computed during a parallel run will always disqualify itself. Serial
-(`MUTANT_JOBS=1`) on a quiet host is the only measurement that means anything,
-and here it returned the same answer.
+reads as "these proofs refute their mutants", and say which budget produced
+them. And do not diagnose them as load without measuring: a mutation run fans
+out and becomes its own load source, so a split computed during a parallel run
+will always disqualify itself. Serial (`MUTANT_JOBS=1`) on a quiet host is the
+only measurement that means anything, and here it returned the same answer.
 
 The mutation runs pass `-wp-cache none` for a related reason. WP's cache
 defaults to `update` and stores a timeout as a stored verdict just like a

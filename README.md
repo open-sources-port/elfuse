@@ -15,7 +15,7 @@ linker resolved against an external sysroot via `--sysroot`.
 
 ## Features
 
-- Single native macOS binary (~560 KiB signed), no daemon and no disk
+- Single native macOS binary (under 1 MiB signed), no daemon and no disk
   image
 - Millisecond-scale VM startup; per-syscall overhead is microseconds
 - Native Apple Silicon execution through Hypervisor.framework
@@ -204,9 +204,8 @@ do.
   `posix_spawn`-ing a fresh `elfuse` host process and transferring
   state (see [docs/internals.md](docs/internals.md)).
 - Up to 64 concurrent guest threads per VM (`MAX_THREADS = 64`).
-- Around 213 syscalls implemented; anything outside
-  `src/syscall/dispatch.tbl` returns `-ENOSYS` rather than silently
-  succeeding.
+- The implemented syscall set is `src/syscall/dispatch.tbl`; anything
+  outside it returns `-ENOSYS` rather than silently succeeding.
 - `FUTEX_LOCK_PI` and friends behave as plain mutex acquire / release;
   true priority-inheritance scheduling is not modeled.
 - `sched_setaffinity` is honored as a no-op (returns the all-CPUs

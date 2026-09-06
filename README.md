@@ -81,7 +81,11 @@ boot-time overhead those tools impose.
   gates CI: `cppcheck`, `clang-tidy`, `scan-build`, Infer, and a runtime
   matrix under ASAN, UBSAN, and TSAN. That catches such defects after the
   fact rather than excluding them by construction, which is the honest cost
-  of the choice.
+  of the choice. Frama-C proves each selected function body free of arithmetic
+  runtime errors, assuming its stated preconditions: the WP targets in
+  `mk/verify.mk` (`make verify`) discharge the bounds math in `src/proved/` and
+  the ELF loader's arithmetic helpers under `-wp-rte`, and
+  `make verify-mutants` asserts each proof rejects a known-broken source.
 - The host surface is nearly all C ABI: Hypervisor.framework, Mach, pthreads,
   macOS syscalls, `SCM_RIGHTS`, and hosting Apple Rosetta. The EL1 shim is
   aarch64 assembly under any host language.
@@ -173,14 +177,17 @@ make elfuse        # build and codesign build/elfuse
 make check         # quick unit suite + BusyBox applet smoke
 make test-gdbstub  # debugger integration
 make test-matrix   # cross-check elfuse against QEMU on the same corpus
+make verify        # Frama-C WP proofs
 make lint          # clang-tidy
 ```
 
 `make check` is the recommended pre-commit gate. `make test-matrix` is the
 recommended gate for changes touching procfs, dynamic linking, networking,
 or process semantics. `make test-rosetta-all` covers the x86_64 acceptance
-suites in isolation. See [docs/testing.md](docs/testing.md) for the full
-target list, fixture flow, and validation-by-change-type guidance.
+suites in isolation. `make verify` and `make verify-mutants` gate changes to
+`src/proved/`, to the ACSL contracts, or to any function a proof target
+names. See [docs/testing.md](docs/testing.md) for the full target list,
+fixture flow, and validation-by-change-type guidance.
 
 The first `make` in a fresh clone installs Git hooks that run the same checks
 CI does, at commit and push time instead of after: staged formatting, comment

@@ -1774,22 +1774,53 @@ It is a property of how the loader is structured.
 
 ### Verification Actually In Place
 
-No formal-methods gate exists today. What gates CI is language-independent
-tooling: `clang-format`, a banned-API and unsafe-preprocessor scan,
-`cppcheck`, and the dispatch-table consistency check on Linux; `scan-build`
-as an advisory job; `clang-tidy` advisory except for
-`readability-function-size`, which is named in `WarningsAsErrors` and fails
-the job when a function crosses its ceiling; an Infer run that fails on any
-finding;
-and a runtime matrix under ASAN, UBSAN, and TSAN (see [Testing And
-Confidence](#testing-and-confidence)).
+The language-independent tooling gates CI: `clang-format`, a banned-API and
+unsafe-preprocessor scan, `cppcheck`, and the dispatch-table consistency check
+on Linux; `scan-build` as an advisory job; `clang-tidy` advisory except for
+`readability-function-size`, which is named in `WarningsAsErrors` and fails the
+job when a function crosses its ceiling; an Infer run that fails on any
+finding; and a runtime matrix under ASAN, UBSAN, and TSAN (see [Testing And
+Confidence](#testing-and-confidence)). That catches memory-safety defects after
+the fact rather than excluding them by construction, which is the honest cost
+of the choice.
 
-That catches memory-safety defects after the fact rather than excluding them
-by construction, which is the honest cost of the choice. The improvement
-worth pursuing on this surface is a proof obligation over the ELF parser
-rather than another runtime check, because a guest-triggerable abort inside a
-VMM is a denial of service, and a language that panics on bad input does not
-address that.
+The formal layer proves each selected function body free of arithmetic runtime
+errors, assuming its stated preconditions. `.github/workflows/verify.yml` runs
+the targets a change can move, split between a proof leg and a per-target
+mutation matrix, with a final job that requires both halves; `make verify`
+runs the whole set locally. Each target names a function set and discharges
+its obligations with `-wp-rte`, which adds the implicit runtime-error goals
+(overflow, out-of-bounds, invalid dereference) that the ACSL contracts alone
+leave open.
+`verify-elf` covers the named arithmetic helpers in `src/core/elf.c`, not
+`elf_load_fd`, `elf_map_segments_fd`, or their call-site preconditions; the
+others cover the bounds math of the remaining attacker-facing parsers and
+packers.
+
+Two shapes, and `mk/verify.mk` is the list that says which one a target is.
+Most name functions in a header under `src/proved/`, which is what lets one
+`.c` file's arithmetic be proved while the rest of that file stays unparsable
+to the analyzer. A few name functions in a `.c` file directly, so the loops
+are proved as written rather than as a copy of the math.
+
+Four gates close the ways a proof can say less than it appears to:
+
+- `scripts/check-proof-targets.py` (in `make check`): nothing lands in
+  `src/proved/` without a proof target.
+- `scripts/check-acsl-coverage.py`: a contracted function left out of the
+  proof set is an assumed axiom, so the target fails rather than trusting it.
+- `make verify-mutants`: each target must reject a known-broken source, which
+  is what catches a contract whose clauses do not bite.
+- `make check-contracts`: rebuilds with `-DELFUSE_CONTRACT_ASSERT` so the
+  expressible preconditions of `proved/gva.h` are checked on every call the
+  suite makes, since `src/core/guest.c` does not parse under the analyzer and
+  nothing else checks its call sites.
+
+What the proofs do not cover: the I/O around the proved arithmetic (`pread`,
+`malloc`) stays test-covered, and preconditions at call sites in files the
+analyzer cannot parse are review-only. `frama-c-stubs/` supplies the Darwin
+declarations the analyzer needs, held to the SDK's own values by
+`scripts/check-stub-constants.py`.
 
 ### Host Interface Surface
 
@@ -1818,6 +1849,10 @@ layers for that surface.
 - `make test-matrix` -- cross-checks elfuse (aarch64), QEMU (aarch64),
   and elfuse (x86_64-via-Rosetta) on overlapping corpora, with per-host
   baselines for the Rosetta branch.
+- `make verify` and `make verify-mutants`: the Frama-C WP proof targets, and
+  the assertion that each of them rejects a known-broken source. Run the two
+  together, and not beside a timing lane, because both fan out and the timed
+  lanes fail under the load they create.
 
 The rule for contributors is simple: match the validation depth to the
 subsystem you changed. Procfs, process state, dynamic linking, and

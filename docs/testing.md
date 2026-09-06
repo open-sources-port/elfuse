@@ -81,6 +81,7 @@ make check
 make test-rosetta-all
 make test-gdbstub
 make test-matrix
+make verify
 make lint
 make clean
 ```
@@ -204,6 +205,21 @@ What they do:
   assembled from the rebuilt binaries. It also runs as a lane of `make check`.
 - `make test-matrix`: cross-check `elfuse` (aarch64), QEMU (aarch64),
   and `elfuse` (x86_64-via-Rosetta) on overlapping corpora
+- `make verify`: every Frama-C WP proof target, one `frama-c` process each
+  and parallel by default (`VERIFY_JOBS=1` for serial). Each target names a
+  function set and discharges its obligations under `-wp-rte`; `mk/verify.mk`
+  is the target list and records the data model and memory model each one
+  assumes. Needs `opam install frama-c` plus `why3 config detect`; without
+  the latter WP aborts with "Prover not found" instead of reporting unproved
+  goals. `make verify-<name>` runs one target
+- `make verify-mutants`: assert every proof target rejects a known-broken
+  source, so a contract whose clauses do not bite fails. `MUTANT_TARGET=<name>`
+  narrows it to one target, `MUTANT_SINCE=<ref>` to what a branch touched, and
+  `MUTANT_JOBS=N` overrides the one-per-core default
+- `make check-contracts`: rebuild with `-DELFUSE_CONTRACT_ASSERT` so the
+  expressible `proved/gva.h` preconditions are checked on every call the suite
+  makes. Separate from `make check` because those checks sit on the
+  `guest_read` / `guest_write` hot path
 - `make lint`: static analysis through `clang-tidy`
 
 ## Quick Iteration

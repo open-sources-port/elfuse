@@ -91,11 +91,34 @@ What they do:
 - `make check`: fast elfuse-internal gate. Runs, in order:
   - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
     entry without a direct or aliased test reference fails the build
+  - `scripts/check-eintr-contract.py` so a new interruptible wait fails
+    the build until it states whether it may be restarted (`forbids`,
+    `restartable`, or `not-a-wait`), with the `forbids` claims checked
+    against the source
   - `scripts/check-lock-order.py` so a new file-scope `pthread_mutex_t`
     or `pthread_rwlock_t` that the lock-ordering block at the top of
     `src/syscall/internal.h` does not name fails the build. Membership
     only: whether the lock belongs in the ordered list or the leaf list
     stays a judgement for review
+  - `scripts/check-atomics.py` so a C11 atomic call written without its
+    `_explicit` form, or a `__atomic_*` / `__sync_*` builtin, fails the
+    build. Plain-operator access to an `_Atomic` object needs the
+    declarations resolved and stays a review question
+  - `scripts/check-ascii.py` so a source file carrying non-ASCII outside
+    the comment-diagram set fails the build
+  - `scripts/check-svc-tails.py` so an HVC #5 return tail cannot reach EL0
+    without the X7 ptrace test
+  - `scripts/check-skill-refs.py` so a path, make target, or docs section
+    a skill names that no longer resolves fails the build
+  - `scripts/check-proof-targets.py` so a header added under `src/proved/`
+    with no proof target fails here rather than on the branch later. It
+    asks make for the target list, which is the point: a `VERIFY_<T>_SRC`
+    block written below the `:=` that builds `VERIFY_TARGETS` parses fine
+    and generates no rule
+  - the two harness self-tests, `test-config` (that `tests/test-config.sh`
+    keeps its CLI mode separate from its sourced mode) and `test-runner`
+    (the shared shell runner's output matching and exit-status checks), so
+    the harness is known good before any lane leans on it
   - the unit suite from `tests/manifest.txt` -- deliberately narrow: the
     elfuse-internal implementation tests with no real Linux counterpart (the
     EL1 shim fast-path suite, `test-mremap-infra`, `test-mremap-fork-tracking`,

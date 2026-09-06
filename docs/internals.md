@@ -1752,16 +1752,17 @@ arguments arriving as guest-controlled integers.
 
 ### What Defects Surface In Practice
 
-One worked example, from the loader. `elf_load_fd` saturates `load_max` to
-`UINT64_MAX` when `p_vaddr + p_memsz` overflows (`src/core/elf.c`). For
-`ET_EXEC` the saturation does its job: the fits-in-guest check in
-`src/syscall/exec.c` sees `UINT64_MAX` and rejects the image. For `ET_DYN`
-that check first adds `PIE_LOAD_BASE`, and the sum wraps to `0x3FFFFF`, which
-passes. Nothing lands out of bounds, because `elf_map_segments_fd`
-bounds-checks every segment against `guest_size`. What moves is the
-rejection: it lands at a call site past the `execve` point of no return,
-turning a recoverable `-ENOEXEC` into a fatal exec. Guarding it takes an
-explicit checked add where `load_max` meets the load base.
+One worked example, from the loader. A PT_LOAD whose `p_vaddr + p_memsz`
+overflows is rejected where it is parsed, by the checked `elf_add_no_wrap`
+(`src/core/elf.c`), and `verify-elf` discharges that arithmetic as a proof
+obligation. Saturating `load_max` to `UINT64_MAX` is the alternative that does
+not hold: every consumer adds a load base to it before comparing against
+`guest_size`, so the clamp relocates the wrap into the consumer, where the
+bound check it was meant to trip reads `elf_end > guest_size` and passes.
+Where the image lands is a separate question, checked per segment by
+`elf_place_segment` under `elf_check_placement`, which `sys_execve` calls
+before its point of no return so an unplaceable image is a recoverable
+`-ENOEXEC` rather than a fatal exec.
 
 The class of defect is the point. That is integer arithmetic, not memory
 safety. Rust's `+` wraps silently in release builds too, so the same checked

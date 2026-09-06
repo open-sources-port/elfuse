@@ -73,10 +73,12 @@ boot-time overhead those tools impose.
   than leave it to convention, which is a real gain, but the checks inside
   those accessors are the same ones to get right.
 - The defects that surface here are arithmetic and design errors, not
-  memory-safety errors. An overflow-saturated `load_max` in `src/core/elf.c`
-  wraps once the PIE load base is added in `src/syscall/exec.c`, pushing a
-  rejection past the `execve` point of no return. Rust's `+` wraps in release
-  builds too; catching it takes an explicit checked add either way.
+  memory-safety errors. An ELF whose `p_vaddr + p_memsz` overflows has to be
+  rejected where `src/core/elf.c` parses it: saturating `load_max` to
+  `UINT64_MAX` instead relocates the wrap into every consumer that adds a
+  load base, where the `elf_end > guest_size` check it was meant to trip
+  passes. Rust's `+` wraps in release builds too; catching it takes an
+  explicit checked add either way.
 - What guards the memory-safety side is language-independent and already
   gates CI: `cppcheck`, `clang-tidy`, `scan-build`, Infer, and a runtime
   matrix under ASAN, UBSAN, and TSAN. That catches such defects after the

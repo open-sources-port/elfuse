@@ -299,6 +299,14 @@ That has a few direct implications:
   work entirely inside the VM. Programs that link against `libfuse`
   (sshfs, ntfs-3g, AppImage runtimes) run without macFUSE, FUSE-T, or
   FSKit on the host.
+- USB devices attached to the Mac are reachable: `/dev/bus/usb` and
+  `/sys/bus/usb/devices` are built from the IOKit registry, and opening a
+  device node gives a usbdevfs fd whose synchronous ioctls (interface claim,
+  control and bulk transfers) drive the device through IOKit. Asynchronous
+  URB submission is not implemented, and macOS arbitrates per interface: a
+  claim fails while a host driver holds that interface open. See
+  [internals.md](internals.md), section "USB Device Passthrough", for the
+  per-ioctl gaps.
 
 ## OCI Images
 

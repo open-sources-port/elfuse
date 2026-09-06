@@ -31,11 +31,13 @@ linker resolved against an external sysroot via `--sysroot`.
   case-colliding names on the default case-folding APFS (see
   [docs/filenames.md](docs/filenames.md))
 - Synthetic `/proc` and selected `/dev` emulation for user-space probes
-- Synthetic USB device tree: `/dev/bus/usb` plus `/sys/bus/usb/devices`
-  built from the IOKit registry, enough for libusb-style enumeration
-  (a udev-backed `lsusb` also needs `name_to_handle_at`, which is not
-  implemented yet; and macOS publishes no root hubs, so there are no
-  `usbN` entries and `lsusb -t` lists devices without their bus rows)
+- USB device passthrough: `/dev/bus/usb` and `/sys/bus/usb/devices` are
+  built from the IOKit registry, and opening a device node yields a
+  usbdevfs fd whose synchronous ioctls (interface claim, control and bulk
+  transfers) drive the attached device through IOKit. Asynchronous URB
+  submission is not implemented; a udev-backed `lsusb` also needs
+  `name_to_handle_at`, and macOS publishes no root hubs, so there are no
+  `usbN` entries and `lsusb -t` lists devices without their bus rows
 - Guest-internal FUSE: `/dev/fuse` and `mount("fuse")` work without
   macFUSE / FUSE-T / FSKit
 - Built-in GDB Remote Serial Protocol stub usable from `gdb` or `lldb`

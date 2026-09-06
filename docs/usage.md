@@ -299,6 +299,29 @@ That has a few direct implications:
   work entirely inside the VM. Programs that link against `libfuse`
   (sshfs, ntfs-3g, AppImage runtimes) run without macFUSE, FUSE-T, or
   FSKit on the host.
+- USB devices attached to the Mac are reachable: `/dev/bus/usb` and
+  `/sys/bus/usb/devices` are built from the IOKit registry, and opening a
+  device node gives a usbdevfs fd whose synchronous ioctls (interface claim,
+  control and bulk transfers) drive the device through IOKit. Asynchronous
+  URB submission is not implemented, and macOS arbitrates per interface: a
+  claim fails while a host driver holds that interface open. See
+  [internals.md](internals.md), section "USB Device Passthrough", for the
+  per-ioctl gaps.
+
+## Diagnostic Environment Variables
+
+Off by default, and useful when a guest misbehaves rather than in normal use:
+
+- `ELFUSE_STARTUP_TRACE`: `steps` prints per-step VM bring-up timings,
+  `syscalls` prints a per-syscall histogram of startup traffic (frozen at the
+  first `execve`, so steady-state calls do not swamp it), `all` does both.
+  Comma-separated tokens are accepted, and `1` is a legacy alias for `steps`.
+- `ELFUSE_SHIM_STATS=1`: dump the EL1 shim counter table to stderr at exit, so
+  a syscall that should be served inside the shim but takes the HVC #5 exit is
+  attributed without a rebuild.
+- `ELFUSE_DISABLE_TLBI_RANGE=1`: refuse `FEAT_TLBIRANGE` and fall back to
+  per-page and broadcast invalidation, which separates a stale-TLB bug from
+  the range-encoding path.
 
 ## OCI Images
 
